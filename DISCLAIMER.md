@@ -27,14 +27,20 @@ The user assumes all responsibility and risk for the use of this tool. The autho
 
 ### What This Tool Does
 
-This tool **only performs read operations** against Active Directory via standard LDAP queries. It does not:
+By default, this tool **only performs read operations** against Active Directory via standard LDAP queries.
 
-- Modify any Active Directory objects
-- Perform any exploitation or attacks
-- Create, delete, or alter any accounts or permissions
-- Write to `msDS-AllowedToActOnBehalfOfOtherIdentity` or any other attribute
+When the `--write-rbcd` or `--clear-rbcd` flags are explicitly used, the tool can **modify** the `msDS-AllowedToActOnBehalfOfOtherIdentity` attribute on target computer objects. These write operations:
 
-It is an **enumeration tool only** — it identifies potential RBCD attack paths but does not exploit them.
+- Are never triggered automatically — they require explicit command-line flags
+- Require interactive confirmation before execution
+- Only modify a single attribute (`msDS-AllowedToActOnBehalfOfOtherIdentity`)
+
+The tool does not:
+
+- Perform S4U2Self/S4U2Proxy ticket delegation or any Kerberos attacks
+- Execute DCSync, PSExec, or any post-exploitation techniques
+- Create, delete, or alter any accounts, groups, or other AD objects
+- Modify any attribute other than `msDS-AllowedToActOnBehalfOfOtherIdentity`
 
 ### Responsible Disclosure
 
