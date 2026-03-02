@@ -38,7 +38,7 @@ The **anonymous/guest access check** was inspired by a real-world scenario where
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/Get-RBCD-Threaded-py.git
+git clone https://github.com/0xGunrunner/Get-RBCD-Threaded-py.git
 cd Get-RBCD-Threaded-py
 
 # Create a virtual environment (recommended)
