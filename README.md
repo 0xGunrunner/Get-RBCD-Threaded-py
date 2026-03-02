@@ -4,6 +4,8 @@ A Python port of [Get-RBCD-Threaded](https://github.com/FatRodzianko/Get-RBCD-Th
 
 Built for offensive security professionals who need this capability natively on Linux/Kali without requiring a Windows host or .NET runtime.
 
+> **⚠️ DISCLAIMER: This tool is provided strictly for authorized security testing, academic research, and educational purposes. It must only be used against systems you own or have explicit written permission to test. Unauthorized use against any system is illegal and unethical. The author assumes no liability for misuse. See [DISCLAIMER.md](DISCLAIMER.md) for full legal details.**
+
 ## What It Does
 
 The tool queries Active Directory via LDAP to enumerate all users, groups, and computer objects, then parses the raw DACL (security descriptor) on every computer object to identify principals with dangerous write permissions:
@@ -199,6 +201,47 @@ This tool performs standard LDAP queries, which may be difficult to detect. Poss
 
 - **Netflow analysis** — Large volumes of LDAP queries to a single host
 - **Honeypot accounts** — Computer objects with deliberately weak DACLs; monitor for modifications to `msDS-AllowedToActOnBehalfOfOtherIdentity`
+
+## ⚠️ Legal Disclaimer & Responsible Use
+
+### Intended Use
+
+This tool is intended **exclusively** for:
+
+- **Authorized penetration testing** — with explicit written permission from the system owner
+- **Red team engagements** — conducted under a signed Rules of Engagement (RoE)
+- **Security research and education** — in lab environments you own or control
+- **Defensive security** — identifying and remediating RBCD misconfigurations in your own environment
+
+### What This Tool Does NOT Do
+
+This is a **read-only enumeration tool**. It performs standard LDAP queries only. It does **not**:
+
+- Exploit any vulnerability
+- Modify any Active Directory object or attribute
+- Write to `msDS-AllowedToActOnBehalfOfOtherIdentity`
+- Perform any RBCD attack, S4U2Self/S4U2Proxy, or DCSync
+- Create, delete, or alter accounts, groups, or permissions
+
+### Legal Considerations
+
+Unauthorized access to computer systems is a criminal offense in virtually every jurisdiction. Relevant laws include but are not limited to:
+
+- **United States**: Computer Fraud and Abuse Act (CFAA), 18 U.S.C. § 1030
+- **European Union**: Directive 2013/40/EU on attacks against information systems
+- **United Kingdom**: Computer Misuse Act 1990
+- **Vietnam**: Law on Cybersecurity (No. 24/2018/QH14) and the Penal Code (Articles 286-289 on computer-related offenses)
+- **International**: Budapest Convention on Cybercrime
+
+The legality of possessing, distributing, or using security testing tools varies by jurisdiction and may depend on intent, authorization, and context. This tool is published in good faith for legitimate security purposes, similar to widely-used open-source tools such as Nmap, BloodHound, and Impacket. The author makes no legal representations about the permissibility of this tool in any specific jurisdiction.
+
+**You are solely responsible for ensuring your use of this tool complies with all applicable laws and regulations in your jurisdiction.**
+
+### No Warranty
+
+This software is provided "as is" without warranty of any kind. The author is not responsible for any damages, legal consequences, or misuse arising from the use of this tool. See [LICENSE](LICENSE) for full terms.
+
+For the complete disclaimer, see [DISCLAIMER.md](DISCLAIMER.md).
 
 ## Credits
 
